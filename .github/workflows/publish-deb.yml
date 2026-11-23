@@ -1,0 +1,151 @@
+name: Build & Publish syspulse .deb to Nexus (APT)
+
+on:
+  push:
+    branches: ["release"]
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.21"
+  PKG: syspulse
+  NEXUS_REPO: syspulse     # имя hosted APT-репозитория в Nexus
+  APT_DIST: stable         # Distribution, указанная при создании репозитория
+  APT_COMPONENT: main      # Nexus всегда публикует в компонент main
+  DOCKER_NET: ci           # docker-сеть, в которой запущен контейнер nexus
+
+jobs:
+  build-publish-verify:
+    runs-on: self-hosted   # раннер из Практики №3
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 1. BUILD ──────────────────────────────────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false     # go.sum нет (внешних зависимостей нет)
+
+      - name: Build static Linux binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w" -o "dist/${PKG}" .
+          ls -lh "dist/${PKG}"
+          # Доказательство статической линковки (для отчёта)
+          file "dist/${PKG}" || true
+
+      # ── 2. PACKAGE ────────────────────────────────────────────────────
+      - name: Package as .deb
+        id: pack
+        run: |
+          set -euo pipefail
+          # Версия берётся из main.go — рассинхронизация исключена
+          VER=$(grep -oP 'const Version = "\K[0-9][0-9A-Za-z.+~-]*' main.go)
+          test -n "${VER}"
+          echo "Building ${PKG} ${VER}"
+
+          ROOT="build/${PKG}_${VER}_amd64"
+          rm -rf build
+          mkdir -p "${ROOT}/DEBIAN" "${ROOT}/usr/bin"
+          install -m 0755 "dist/${PKG}" "${ROOT}/usr/bin/${PKG}"
+          SIZE=$(du -sk "${ROOT}/usr" | cut -f1)
+
+          cat > "${ROOT}/DEBIAN/control" <<EOF
+          Package: ${PKG}
+          Version: ${VER}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: DevOps Team <devops@example.com>
+          Installed-Size: ${SIZE}
+          Depends: libc6 (>= 2.17)
+          Description: Lightweight CLI tool for a system health snapshot
+           Reads /proc and reports uptime, load average and memory info.
+          EOF
+
+          DEB="dist/${PKG}_${VER}_amd64.deb"
+          dpkg-deb --build --root-owner-group "${ROOT}" "${DEB}"
+
+          echo "---- dpkg-deb --info ----";     dpkg-deb --info "${DEB}"
+          echo "---- dpkg-deb --contents ----"; dpkg-deb --contents "${DEB}"
+
+          echo "pkg_ver=${VER}"  >> "$GITHUB_OUTPUT"
+          echo "deb_path=${DEB}" >> "$GITHUB_OUTPUT"
+
+      # ── 3. PUBLISH ────────────────────────────────────────────────────
+      - name: Upload .deb to Nexus (REST components API)
+        env:
+          NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+          DEB: ${{ steps.pack.outputs.deb_path }}
+        run: |
+          set -euo pipefail
+          BASE="http://${NEXUS_HOST}:8081"
+
+          HTTP=$(curl -sS -o /tmp/nexus_resp.txt -w '%{http_code}' \
+            -u "${NEXUS_USER}:${NEXUS_PASSWORD}" \
+            -X POST "${BASE}/service/rest/v1/components?repository=${NEXUS_REPO}" \
+            -F "apt.asset=@${DEB}")
+          if [ "${HTTP}" != "204" ]; then
+            echo "❌ Nexus upload failed, HTTP ${HTTP}"
+            cat /tmp/nexus_resp.txt
+            exit 1
+          fi
+          echo "✅ $(basename "${DEB}") deployed to Nexus repo '${NEXUS_REPO}'"
+
+          # Проверяем, что Nexus сгенерировал APT-метаданные
+          REPO_URL="${BASE}/repository/${NEXUS_REPO}"
+          for i in 1 2 3 4 5; do
+            if curl -fsS "${REPO_URL}/dists/${APT_DIST}/${APT_COMPONENT}/binary-amd64/Packages" \
+                 | grep -A2 "^Package: ${PKG}$"; then
+              break
+            fi
+            echo "metadata not ready yet, retry ${i}..."; sleep 3
+            [ "${i}" = 5 ] && exit 1
+          done
+          echo "---- Release ----";  curl -fsS "${REPO_URL}/dists/${APT_DIST}/Release" | head -n 15
+          echo "---- InRelease (signed) ----"; curl -fsS "${REPO_URL}/dists/${APT_DIST}/InRelease" | head -n 3
+
+      # ── 4. VERIFY ─────────────────────────────────────────────────────
+      - name: Verify install via apt in clean ubuntu:22.04
+        env:
+          VER: ${{ steps.pack.outputs.pkg_ver }}
+        run: |
+          set -euo pipefail
+          # Без -it: в CI нет TTY. Контейнер в той же docker-сети, что и Nexus,
+          # поэтому Nexus доступен по имени контейнера: http://nexus:8081
+          docker run --rm --network "${DOCKER_NET}" \
+            -e VER -e PKG -e NEXUS_REPO -e APT_DIST -e APT_COMPONENT \
+            -v "${PWD}/ci/syspulse-archive-keyring.gpg:/usr/share/keyrings/syspulse-archive-keyring.gpg:ro" \
+            ubuntu:22.04 bash -c '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              # Бонус: репозиторий подписан GPG, подключаем через signed-by вместо trusted=yes
+              echo "deb [signed-by=/usr/share/keyrings/syspulse-archive-keyring.gpg] http://nexus:8081/repository/${NEXUS_REPO}/ ${APT_DIST} ${APT_COMPONENT}" \
+                > /etc/apt/sources.list.d/syspulse.list
+              apt-get update
+              apt-get install -y --no-install-recommends "${PKG}=${VER}"
+              echo "---- package info ----"
+              dpkg -s "${PKG}" | grep -E "^(Package|Status|Version|Architecture)"
+              echo "---- run app ----"
+              OUT=$(${PKG} --version)
+              echo "${OUT}"
+              [ "${OUT}" = "${PKG} ${VER}" ] || { echo "❌ version mismatch"; exit 1; }
+              ${PKG}
+            '
+          echo "✅ Verification passed: ${PKG} ${VER} installed from Nexus via apt"
+
+      # ── 5. ARTIFACT ───────────────────────────────────────────────────
+      - name: Save .deb as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syspulse-deb
+          path: dist/*.deb
+          retention-days: 7
+          if-no-files-found: ignore
